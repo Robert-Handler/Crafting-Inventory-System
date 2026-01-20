@@ -1,0 +1,41 @@
+# ✅ **.gitignore (Place this in the root)**  
+This is a clean, correct `.gitignore` for a Python project using FastAPI, VS Code, and OneDrive.
+
+```gitignore
+# Python build and cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+*.pkl
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+venv/
+.venv/
+
+# Environment variables / secrets
+.env
+*.env
+
+# IDE-specific files
+.vscode/
+.idea/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# OneDrive temporary files
+*.tmp
+~$*
+
+# Logs
+*.log
+
+# FastAPI / Uvicorn caches
+*.db-journal
