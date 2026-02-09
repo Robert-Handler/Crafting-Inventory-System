@@ -26,6 +26,9 @@ import json
 import getpass
 from typing import Optional, Dict, Any
 
+import requests
+
+
 # ----------------------------
 # Configuration & Environment
 # ----------------------------
