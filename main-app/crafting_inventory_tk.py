@@ -138,7 +138,7 @@ class AppState:
                 updated=datetime(2026, 1, 26)
             ),
         ]
-        self.next_id: int = 4
+        self.next_id: int = (max((s.id for s in self.supplies), default=0) +1)
 
         # UI state
         self.search_query: str = ""
@@ -377,15 +377,38 @@ class SortFilterDialog(tk.Toplevel):
 # Screens (S0, S1, S2, S3a, S3b)
 # ---------------------------
 
-class LoginScreen(ttk.Frame):
-    """S0: Welcome/Login"""
+
+class HomeScreen(ttk.Frame):
+    """Home page: Welcome/Login + tagline"""
     def __init__(self, master, app: "App"):
         super().__init__(master, padding=16)
         self.app = app
-        ttk.Label(self, text="Crafting Inventory", font=("Segoe UI", 16, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 12))
-        # form
+
+        # Title
+
+        title = ttk.Label(
+            self,
+            text="Crafting Inventory",
+            font=("Segoe UI", 16, "bold")
+        )
+        title.grid(row=0, column=0, sticky="w", pady=(0, 4))
+
+        spacer = tk.Frame(self, height=50)
+        spacer.grid(row=1, column=0, sticky="ew")
+        spacer.grid_propagate(False)
+
+        # Tagline - its own row
+        tagline = ttk.Label(
+            self,
+            text="Keep track of all your crafting needs",
+            font=("Segoe UI", 12),
+            foreground="#444"
+        )
+        tagline.grid(row=2, column=0, sticky="w", pady=(0, 12))
+
+        # Login form
         frm = ttk.LabelFrame(self, text="Welcome")
-        frm.grid(row=1, column=0, sticky="ew")
+        frm.grid(row=3, column=0, sticky="ew", pady=(0, 10))
         ttk.Label(frm, text="Username").grid(row=0, column=0, sticky="w", padx=10, pady=(10, 4))
         self.ent_user = ttk.Entry(frm, width=32)
         self.ent_user.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 8))
@@ -393,20 +416,21 @@ class LoginScreen(ttk.Frame):
         self.ent_pass = ttk.Entry(frm, show="•", width=32)
         self.ent_pass.grid(row=3, column=0, sticky="w", padx=10, pady=(0, 8))
         self.var_remember = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frm, text="Remember me", variable=self.var_remember).grid(row=4, column=0, sticky="w", padx=10, pady=(0,10))
+        ttk.Checkbutton(frm, text="Remember me", variable=self.var_remember).grid(
+            row=4, column=0, sticky="w", padx=10, pady=(0, 10)
+        )
 
         btns = ttk.Frame(frm)
         btns.grid(row=5, column=0, sticky="w", padx=10, pady=(0, 10))
         ttk.Button(btns, text="Log in", command=self._login).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(btns, text="Help", command=lambda: messagebox.showinfo("Help", "Enter your credentials. Press Enter to submit.")).grid(row=0, column=1)
 
-        # key bindings
+        # Key bindings
         self.ent_user.bind("<Return>", lambda e: self._login())
         self.ent_pass.bind("<Return>", lambda e: self._login())
 
-        # status/banner area (S5)
+        # Inline banner (S5)
         self.banner = Banner(self)
-        # initial hint
         self.after(250, lambda: self.banner.show("info", "Tip: Press Enter to submit."))
 
     def focus_first(self):
@@ -418,10 +442,11 @@ class LoginScreen(ttk.Frame):
         if not u or not p:
             self.banner.show("warn", "Please enter both username and password.")
             return
-        # For Sprint 1, any non-empty credentials are "valid"
+        # Sprint 1 behavior: any non-empty credentials
         self.app.state.current_user = u
         self.app.show_inventory()
         self.app.show_banner("success", f"Welcome, {u}!")
+
 
 class InventoryScreen(ttk.Frame):
     """S1: Inventory Home (list, search, sort/filter, add, pagination)"""
@@ -912,6 +937,7 @@ class AddLookupScreen(ttk.Frame):
 # App Shell (navigation, banner, logout)
 # ---------------------------
 
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -924,7 +950,12 @@ class App(tk.Tk):
         # Root layout: Topbar (title row), Banner (S5), Content frame
         self.topbar = ttk.Frame(self, padding=(10, 10, 10, 0))
         self.topbar.grid(row=0, column=0, sticky="ew")
-        ttk.Label(self.topbar, text="Crafting Inventory", font=("Segoe UI", 14, "bold")).grid(row=0, column=0, sticky="w")
+        self.topbar.columnconfigure(0, weight=1)
+        ttk.Label(self.topbar, text="Crafting Inventory", font=("Segoe UI", 14, "bold")).grid(
+            row=0, column=0, sticky="w"
+        )
+        # NEW: persistent Home button (available on all screens)
+        ttk.Button(self.topbar, text="Home", command=self.show_home).grid(row=0, column=1, sticky="e")
 
         self.banner = Banner(self)
         # placeholder grid row for banner is row=1 (Banner handles its own show/hide)
@@ -934,9 +965,9 @@ class App(tk.Tk):
         self.rowconfigure(2, weight=1)
         self.columnconfigure(0, weight=1)
 
-        # Screens
+        # Screens (swap LoginScreen -> HomeScreen)
         self.screens: Dict[str, ttk.Frame] = {
-            "login": LoginScreen(self.content, self),
+            "home": HomeScreen(self.content, self),
             "inventory": InventoryScreen(self.content, self),
             "detail": DetailScreen(self.content, self),
             "add_manual": AddManualScreen(self.content, self),
@@ -945,19 +976,20 @@ class App(tk.Tk):
         for s in self.screens.values():
             s.grid(row=0, column=0, sticky="nsew")
 
-        self.show_login()
+        # Start at Home
+        self.show_home()
 
     # --- Navigation ---
     def _raise(self, key: str):
         self.screens[key].tkraise()
         # call screen-specific hooks
-        if key == "login":
-            self.screens["login"].focus_first()
+        if key == "home":
+            self.screens["home"].focus_first()
         if key == "inventory":
             self.screens["inventory"].on_show()
 
-    def show_login(self):
-        self._raise("login")
+    def show_home(self):
+        self._raise("home")
 
     def show_inventory(self):
         self._raise("inventory")
@@ -976,24 +1008,6 @@ class App(tk.Tk):
     def show_banner(self, kind: str, message: str, retry: Optional[Callable[[], None]] = None):
         self.banner.show(kind, message, retry)
 
-    # --- Logout (S6) ---
-    def confirm_logout(self):
-        dlg = tk.Toplevel(self)
-        dlg.title("Logout")
-        dlg.resizable(False, False)
-        frm = ttk.Frame(dlg, padding=12)
-        frm.grid(sticky="nsew")
-        ttk.Label(frm, text="Are you sure you want to logout?").grid(row=0, column=0, columnspan=2, pady=(0, 12))
-        ttk.Button(frm, text="Logout", command=lambda: self._do_logout(dlg)).grid(row=1, column=0, padx=4)
-        ttk.Button(frm, text="Cancel", command=dlg.destroy).grid(row=1, column=1, padx=4)
-        dlg.transient(self); dlg.grab_set()
-        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
-
-    def _do_logout(self, dlg: tk.Toplevel):
-        dlg.destroy()
-        self.state.current_user = None
-        self.show_login()
-        self.show_banner("info", "Logged out.")
 
 def main():
     app = App()
