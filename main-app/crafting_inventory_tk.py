@@ -1,4 +1,3 @@
-# crafting_inventory_tk.py
 from __future__ import annotations
 import sys
 import math
@@ -8,6 +7,83 @@ from tkinter import ttk, messagebox
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Optional, Callable, Dict, Any
+
+# ---------------------------
+# Microservice client helpers
+# ---------------------------
+try:
+    import requests as _requests
+    _REQUESTS_AVAILABLE = True
+except ImportError:
+    _REQUESTS_AVAILABLE = False
+
+BARCODE_SERVICE_URL = "http://localhost:8020"
+UNIT_SERVICE_URL    = "http://localhost:8010"
+_HTTP_TIMEOUT = 4  # seconds
+
+
+def _http_get(url: str) -> dict:
+    """GET url → parsed JSON dict. Raises RuntimeError on any failure."""
+    if not _REQUESTS_AVAILABLE:
+        raise RuntimeError("'requests' library is not installed. Run: pip install requests")
+    try:
+        r = _requests.get(url, timeout=_HTTP_TIMEOUT)
+    except _requests.exceptions.ConnectionError:
+        raise RuntimeError(f"Cannot connect to service at {url}. Is it running?")
+    except _requests.exceptions.Timeout:
+        raise RuntimeError(f"Request timed out ({_HTTP_TIMEOUT}s): {url}")
+    except Exception as e:
+        raise RuntimeError(str(e))
+    if r.status_code == 404:
+        raise LookupError("Barcode not found in catalog.")
+    if r.status_code == 400:
+        detail = r.json().get("detail", {})
+        raise ValueError(detail.get("details", "Invalid barcode."))
+    if not r.ok:
+        raise RuntimeError(f"Service error {r.status_code}: {r.text[:200]}")
+    return r.json()
+
+
+def _http_post(url: str, payload: dict) -> dict:
+    """POST url with JSON payload → parsed JSON dict. Raises RuntimeError on any failure."""
+    if not _REQUESTS_AVAILABLE:
+        raise RuntimeError("'requests' library is not installed. Run: pip install requests")
+    try:
+        r = _requests.post(url, json=payload, timeout=_HTTP_TIMEOUT)
+    except _requests.exceptions.ConnectionError:
+        raise RuntimeError(f"Cannot connect to service at {url}. Is it running?")
+    except _requests.exceptions.Timeout:
+        raise RuntimeError(f"Request timed out ({_HTTP_TIMEOUT}s): {url}")
+    except Exception as e:
+        raise RuntimeError(str(e))
+    if r.status_code == 400:
+        detail = r.json().get("detail", {})
+        raise ValueError(detail.get("details", "Bad request."))
+    if not r.ok:
+        raise RuntimeError(f"Service error {r.status_code}: {r.text[:200]}")
+    return r.json()
+
+
+def barcode_lookup(barcode: str) -> dict:
+    """
+    Call the Barcode Lookup Service.
+    Returns a dict with keys: name, brand, category, unit, size, description.
+    Raises LookupError (not found), ValueError (bad barcode), RuntimeError (offline/other).
+    """
+    return _http_get(f"{BARCODE_SERVICE_URL}/items/{barcode}")
+
+
+def unit_convert(value: float, from_unit: str, to_unit: str, precision: int = 3) -> dict:
+    """
+    Call the Unit Conversion Service.
+    Returns a dict with keys: value, value_raw, from_unit, to_unit, precision, timestamp.
+    Raises ValueError (unsupported/mixed units), RuntimeError (offline/other).
+    """
+    return _http_post(
+        f"{UNIT_SERVICE_URL}/convert",
+        {"value": value, "from_unit": from_unit, "to_unit": to_unit, "precision": precision},
+    )
+
 
 # ---------------------------
 # Data model & App State
@@ -44,7 +120,6 @@ class Supply:
 class AppState:
     def __init__(self):
         self.current_user: Optional[str] = None
-        # seed with example data for paper prototype and demo
         self.supplies: List[Supply] = [
             Supply(
                 id=1, name="DK Yarn Blue", category="Yarn",
@@ -138,22 +213,19 @@ class AppState:
                 updated=datetime(2026, 1, 26)
             ),
         ]
-        self.next_id: int = (max((s.id for s in self.supplies), default=0) +1)
+        self.next_id: int = (max((s.id for s in self.supplies), default=0) + 1)
 
-        # UI state
         self.search_query: str = ""
-        self.sort_by: str = "name"  # name | quantity | updated
-        self.sort_dir: str = "asc"  # asc | desc
+        self.sort_by: str = "name"
+        self.sort_dir: str = "asc"
         self.filter_categories: set[str] = set()
         self.filter_units: set[str] = set()
         self.filter_color: str = ""
         self.filter_tags: str = ""
 
-        # pagination
         self.page_size: int = 10
-        self.page_index: int = 0  # zero-based
+        self.page_index: int = 0
 
-    # --- supply operations ---
     def add_supply(self, s: Supply) -> Supply:
         s.id = self.next_id
         self.next_id += 1
@@ -173,15 +245,12 @@ class AppState:
                 return s
         return None
 
-    # --- filtering & sorting & pagination ---
     def _matches_filters(self, s: Supply) -> bool:
-        # search across name, category, tags
         q = self.search_query.lower().strip()
         if q:
             hay = " ".join([s.name, s.category, " ".join(s.tags)]).lower()
             if q not in hay:
                 return False
-
         if self.filter_categories and s.category not in self.filter_categories:
             return False
         if self.filter_units and s.unit not in self.filter_units:
@@ -190,7 +259,6 @@ class AppState:
             if self.filter_color.lower() not in (s.color or "").lower():
                 return False
         if self.filter_tags:
-            # substring match in joined tags
             if self.filter_tags.lower() not in " ".join(s.tags).lower():
                 return False
         return True
@@ -208,18 +276,16 @@ class AppState:
         rows = [s for s in self.supplies if self._matches_filters(s)]
         rows.sort(key=self._sort_key, reverse=(self.sort_dir == "desc"))
         total = len(rows)
-
-        # pagination window
         start = self.page_index * self.page_size
         end = start + self.page_size
         return rows[start:end], total
 
+
 # ---------------------------
-# Utility: Banner (S5)
+# Utility: Banner
 # ---------------------------
 
 class Banner(ttk.Frame):
-    """Inline, non-blocking banner for success/info/warn/error with optional Retry."""
     def __init__(self, master, **kwargs):
         super().__init__(master, **kwargs)
         self.configure(padding=(8, 6))
@@ -245,23 +311,15 @@ class Banner(ttk.Frame):
         self._msg.set(message)
         self._retry_cb = retry
 
-        # Color hint via style; fallback to background on classic theme
         bg = {"success": "#E6F4EA", "info": "#E8F0FE", "warn": "#FEF7E0", "error": "#FDE7E9"}.get(kind, "#E8F0FE")
         fg = {"success": "#137333", "info": "#1A73E8", "warn": "#B06000", "error": "#C5221F"}.get(kind, "#1A73E8")
         icon = {"success": "✓", "info": "ℹ", "warn": "⚠", "error": "⛔"}.get(kind, "ℹ")
-
-        # use tk.Frame to force bg color
-        try:
-            self["style"] = ""  # ensure no ttk style overrides
-        except Exception:
-            pass
-        self.configure(style="")
 
         for child in (self, self.icon, self.label):
             try:
                 child.configure(background=bg)
             except tk.TclError:
-                pass  # on some ttk themes background can't be set; it's okay
+                pass
 
         self.icon.configure(text=icon, foreground=fg)
         self.label.configure(foreground=fg)
@@ -279,8 +337,125 @@ class Banner(ttk.Frame):
     def _on_close(self):
         self.hide()
 
+
 # ---------------------------
-# Sort & Filter Dialog (S4)
+# Unit Conversion Dialog
+# ---------------------------
+
+class ConvertDialog(tk.Toplevel):
+    """
+    Small popup that calls the Unit Conversion microservice.
+    On success, writes the converted value back into the caller's qty/unit fields.
+    """
+    def __init__(self, master, app: "App",
+                 initial_value: str, initial_unit: str,
+                 on_accept: Callable[[float, str], None]):
+        super().__init__(master)
+        self.title("Convert Unit")
+        self.resizable(False, False)
+        self.app = app
+        self.on_accept = on_accept
+
+        pad = ttk.Frame(self, padding=14)
+        pad.grid(sticky="nsew")
+
+        # ── From row ──────────────────────────────────────
+        ttk.Label(pad, text="From").grid(row=0, column=0, sticky="w")
+
+        self.ent_value = ttk.Entry(pad, width=12)
+        self.ent_value.insert(0, initial_value)
+        self.ent_value.grid(row=0, column=1, padx=6, pady=4, sticky="w")
+
+        self.cmb_from = ttk.Combobox(pad, values=self._all_units(), state="readonly", width=10)
+        self.cmb_from.set(initial_unit if initial_unit in self._all_units() else "")
+        self.cmb_from.grid(row=0, column=2, padx=4, pady=4, sticky="w")
+
+        # ── To row ────────────────────────────────────────
+        ttk.Label(pad, text="To").grid(row=1, column=0, sticky="w")
+
+        self.cmb_to = ttk.Combobox(pad, values=self._all_units(), state="readonly", width=10)
+        self.cmb_to.grid(row=1, column=2, padx=4, pady=4, sticky="w")
+
+        # ── Result label ──────────────────────────────────
+        self.lbl_result = ttk.Label(pad, text="", foreground="#137333", font=("Segoe UI", 10, "bold"))
+        self.lbl_result.grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 2))
+
+        # ── Buttons ───────────────────────────────────────
+        btns = ttk.Frame(pad)
+        btns.grid(row=3, column=0, columnspan=4, sticky="e", pady=(8, 0))
+        ttk.Button(btns, text="Convert", command=self._do_convert).grid(row=0, column=0, padx=4)
+        self.btn_apply = ttk.Button(btns, text="Apply to form", command=self._apply, state="disabled")
+        self.btn_apply.grid(row=0, column=1, padx=4)
+        ttk.Button(btns, text="Cancel", command=self.destroy).grid(row=0, column=2, padx=4)
+
+        self._converted_value: Optional[float] = None
+        self._converted_unit: Optional[str] = None
+
+        self.transient(master)
+        self.grab_set()
+
+    @staticmethod
+    def _all_units() -> list[str]:
+        # Units supported by the conversion service (mass + length)
+        return ["mg", "g", "kg", "lb", "oz", "mm", "cm", "m", "km", "in", "ft", "yd", "mi"]
+
+    def _do_convert(self):
+        self.lbl_result.config(text="")
+        self.btn_apply.config(state="disabled")
+        self._converted_value = None
+        self._converted_unit = None
+
+        raw = self.ent_value.get().strip()
+        from_u = self.cmb_from.get().strip()
+        to_u = self.cmb_to.get().strip()
+
+        if not raw:
+            self.lbl_result.config(text="Enter a value.", foreground="#B06000")
+            return
+        if not from_u or not to_u:
+            self.lbl_result.config(text="Select both units.", foreground="#B06000")
+            return
+        try:
+            val = float(raw)
+        except ValueError:
+            self.lbl_result.config(text="Value must be a number.", foreground="#C5221F")
+            return
+
+        def attempt():
+            try:
+                result = unit_convert(val, from_u, to_u)
+                converted = result["value"]
+                self._converted_value = converted
+                self._converted_unit = to_u
+                self.lbl_result.config(
+                    text=f"{val:g} {from_u}  →  {converted:g} {to_u}",
+                    foreground="#137333"
+                )
+                self.btn_apply.config(state="normal")
+            except ValueError as e:
+                self.lbl_result.config(text=f"Error: {e}", foreground="#C5221F")
+            except RuntimeError as e:
+                self.lbl_result.config(
+                    text=f"Service unavailable — {e}",
+                    foreground="#C5221F"
+                )
+                # Surface retry in the app-level banner too
+                self.app.show_banner(
+                    "error",
+                    f"Unit Conversion service offline: {e}",
+                    retry=attempt,
+                )
+
+        attempt()
+
+    def _apply(self):
+        if self._converted_value is not None and self._converted_unit is not None:
+            self.on_accept(self._converted_value, self._converted_unit)
+        self.destroy()
+
+
+# ---------------------------
+# Sort & Filter Dialog
 # ---------------------------
 
 class SortFilterDialog(tk.Toplevel):
@@ -293,9 +468,9 @@ class SortFilterDialog(tk.Toplevel):
 
         container = ttk.Frame(self, padding=12)
         container.grid(sticky="nsew")
-        # Sort by
+
         frm_sort = ttk.LabelFrame(container, text="Sort by")
-        frm_sort.grid(row=0, column=0, sticky="ew", padx=(0, 0), pady=(0, 8))
+        frm_sort.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         self.sort_var = tk.StringVar(value=state.sort_by)
         ttk.Radiobutton(frm_sort, text="Name", variable=self.sort_var, value="name").grid(row=0, column=0, sticky="w", padx=8, pady=4)
         ttk.Radiobutton(frm_sort, text="Quantity", variable=self.sort_var, value="quantity").grid(row=0, column=1, sticky="w", padx=8, pady=4)
@@ -307,10 +482,9 @@ class SortFilterDialog(tk.Toplevel):
         ttk.Radiobutton(frm_dir, text="Asc", variable=self.dir_var, value="asc").grid(row=0, column=0, sticky="w", padx=8, pady=4)
         ttk.Radiobutton(frm_dir, text="Desc", variable=self.dir_var, value="desc").grid(row=0, column=1, sticky="w", padx=8, pady=4)
 
-        # Filters
         frm_filters = ttk.LabelFrame(container, text="Filter by")
         frm_filters.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-        # categories
+
         self.vars_cat: Dict[str, tk.BooleanVar] = {}
         ttk.Label(frm_filters, text="Category:").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 0))
         cat_frame = ttk.Frame(frm_filters)
@@ -320,7 +494,6 @@ class SortFilterDialog(tk.Toplevel):
             self.vars_cat[c] = v
             ttk.Checkbutton(cat_frame, text=c, variable=v).grid(row=0, column=i, padx=4, pady=4, sticky="w")
 
-        # units
         self.vars_unit: Dict[str, tk.BooleanVar] = {}
         ttk.Label(frm_filters, text="Unit:").grid(row=2, column=0, sticky="w", padx=8, pady=(8, 0))
         unit_frame = ttk.Frame(frm_filters)
@@ -330,7 +503,6 @@ class SortFilterDialog(tk.Toplevel):
             self.vars_unit[u] = v
             ttk.Checkbutton(unit_frame, text=u, variable=v).grid(row=0, column=i, padx=4, pady=4, sticky="w")
 
-        # color / tags
         ttk.Label(frm_filters, text="Color:").grid(row=4, column=0, sticky="w", padx=8, pady=(8, 0))
         self.ent_color = ttk.Entry(frm_filters, width=24)
         self.ent_color.insert(0, state.filter_color)
@@ -341,7 +513,6 @@ class SortFilterDialog(tk.Toplevel):
         self.ent_tags.insert(0, state.filter_tags)
         self.ent_tags.grid(row=5, column=1, sticky="w", padx=8)
 
-        # Buttons
         frm_btns = ttk.Frame(container)
         frm_btns.grid(row=3, column=0, sticky="e")
         ttk.Button(frm_btns, text="Apply", command=self._apply).grid(row=0, column=0, padx=4)
@@ -373,40 +544,24 @@ class SortFilterDialog(tk.Toplevel):
         self.ent_color.delete(0, tk.END)
         self.ent_tags.delete(0, tk.END)
 
-# ---------------------------
-# Screens (S0, S1, S2, S3a, S3b)
-# ---------------------------
 
+# ---------------------------
+# Screens
+# ---------------------------
 
 class HomeScreen(ttk.Frame):
-    """Home page: Welcome/Login + tagline"""
     def __init__(self, master, app: "App"):
         super().__init__(master, padding=16)
         self.app = app
 
-        # Title
-
-        title = ttk.Label(
-            self,
-            text="Crafting Inventory",
-            font=("Segoe UI", 16, "bold")
-        )
-        title.grid(row=0, column=0, sticky="w", pady=(0, 4))
+        ttk.Label(self, text="Crafting Inventory", font=("Segoe UI", 16, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 4))
 
         spacer = tk.Frame(self, height=50)
         spacer.grid(row=1, column=0, sticky="ew")
         spacer.grid_propagate(False)
 
-        # Tagline - its own row
-        tagline = ttk.Label(
-            self,
-            text="Keep track of all your crafting needs",
-            font=("Segoe UI", 12),
-            foreground="#444"
-        )
-        tagline.grid(row=2, column=0, sticky="w", pady=(0, 12))
+        ttk.Label(self, text="Keep track of all your crafting needs", font=("Segoe UI", 12), foreground="#444").grid(row=2, column=0, sticky="w", pady=(0, 12))
 
-        # Login form
         frm = ttk.LabelFrame(self, text="Welcome")
         frm.grid(row=3, column=0, sticky="ew", pady=(0, 10))
         ttk.Label(frm, text="Username").grid(row=0, column=0, sticky="w", padx=10, pady=(10, 4))
@@ -416,20 +571,16 @@ class HomeScreen(ttk.Frame):
         self.ent_pass = ttk.Entry(frm, show="•", width=32)
         self.ent_pass.grid(row=3, column=0, sticky="w", padx=10, pady=(0, 8))
         self.var_remember = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frm, text="Remember me", variable=self.var_remember).grid(
-            row=4, column=0, sticky="w", padx=10, pady=(0, 10)
-        )
+        ttk.Checkbutton(frm, text="Remember me", variable=self.var_remember).grid(row=4, column=0, sticky="w", padx=10, pady=(0, 10))
 
         btns = ttk.Frame(frm)
         btns.grid(row=5, column=0, sticky="w", padx=10, pady=(0, 10))
         ttk.Button(btns, text="Log in", command=self._login).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(btns, text="Help", command=lambda: messagebox.showinfo("Help", "Enter your credentials. Press Enter to submit.")).grid(row=0, column=1)
 
-        # Key bindings
         self.ent_user.bind("<Return>", lambda e: self._login())
         self.ent_pass.bind("<Return>", lambda e: self._login())
 
-        # Inline banner (S5)
         self.banner = Banner(self)
         self.after(250, lambda: self.banner.show("info", "Tip: Press Enter to submit."))
 
@@ -442,19 +593,16 @@ class HomeScreen(ttk.Frame):
         if not u or not p:
             self.banner.show("warn", "Please enter both username and password.")
             return
-        # Sprint 1 behavior: any non-empty credentials
         self.app.state.current_user = u
         self.app.show_inventory()
         self.app.show_banner("success", f"Welcome, {u}!")
 
 
 class InventoryScreen(ttk.Frame):
-    """S1: Inventory Home (list, search, sort/filter, add, pagination)"""
     def __init__(self, master, app: "App"):
-        super().__init__(master, padding=(10,10))
+        super().__init__(master, padding=(10, 10))
         self.app = app
 
-        # Topbar
         top = ttk.Frame(self)
         top.grid(row=0, column=0, sticky="ew")
         top.columnconfigure(0, weight=1)
@@ -463,13 +611,10 @@ class InventoryScreen(ttk.Frame):
         self.lbl_user.grid(row=0, column=1, sticky="e", padx=(8, 4))
         ttk.Button(top, text="Logout", command=self._logout).grid(row=0, column=2, sticky="e")
 
-        # Status/banner area is in App (S5)
-
-        # Header row with search & actions
         hdr = ttk.Frame(self)
-        hdr.grid(row=2, column=0, sticky="ew", pady=(8,4))
+        hdr.grid(row=2, column=0, sticky="ew", pady=(8, 4))
         ttk.Label(hdr, text="Inventory", font=("Segoe UI", 12, "bold")).grid(row=0, column=0, sticky="w")
-        ttk.Label(hdr, text="[i]", foreground="#555").grid(row=0, column=1, sticky="w", padx=(6,0))
+        ttk.Label(hdr, text="[i]", foreground="#555").grid(row=0, column=1, sticky="w", padx=(6, 0))
 
         search_row = ttk.Frame(self)
         search_row.grid(row=3, column=0, sticky="ew", pady=(2, 8))
@@ -480,12 +625,9 @@ class InventoryScreen(ttk.Frame):
         ttk.Button(search_row, text="Sort & Filter", command=self._open_sort_filter).grid(row=0, column=1, padx=(0, 6))
         ttk.Button(search_row, text="Add Supply", command=self._add_supply).grid(row=0, column=2)
 
-        # Table
-
         columns = ("Name", "Category", "Qty", "Unit", "Color", "Updated", "Action", "ActionID")
         self.tree = ttk.Treeview(self, columns=columns, show="headings", height=10)
 
-        # headings
         self.tree.heading("Name", text="Name")
         self.tree.heading("Category", text="Category")
         self.tree.heading("Qty", text="Qty")
@@ -493,9 +635,8 @@ class InventoryScreen(ttk.Frame):
         self.tree.heading("Color", text="Color")
         self.tree.heading("Updated", text="Updated")
         self.tree.heading("Action", text="View/Edit")
-        self.tree.heading("ActionID", text="")  # hidden
+        self.tree.heading("ActionID", text="")
 
-        # widths
         self.tree.column("Name", width=200)
         self.tree.column("Category", width=90)
         self.tree.column("Qty", width=60, anchor="e")
@@ -503,18 +644,12 @@ class InventoryScreen(ttk.Frame):
         self.tree.column("Color", width=90)
         self.tree.column("Updated", width=100, anchor="center")
         self.tree.column("Action", width=90, anchor="center")
-        self.tree.column("ActionID", width=0, stretch=False)  # hide
+        self.tree.column("ActionID", width=0, stretch=False)
 
-        # Place the Treeview in the grid and let it expand
         self.tree.grid(row=4, column=0, sticky="nsew", pady=(0, 4))
-
-        # (Optional but recommended) Hide the internal ActionID column from display
         self.tree["displaycolumns"] = ("Name", "Category", "Qty", "Unit", "Color", "Updated", "Action")
-
-        # Enable double-click to open detail view
         self.tree.bind("<Double-1>", self._on_double_click)
 
-        # Pagination
         pag = ttk.Frame(self)
         pag.grid(row=5, column=0, sticky="ew", pady=(6, 0))
         self.btn_prev = ttk.Button(pag, text="< Prev", command=lambda: self._go_page(-1))
@@ -524,14 +659,11 @@ class InventoryScreen(ttk.Frame):
         self.btn_next = ttk.Button(pag, text="Next >", command=lambda: self._go_page(1))
         self.btn_next.grid(row=0, column=2, padx=4)
 
-        # Status line (inline info)
         self.lbl_info = ttk.Label(self, text="", foreground="#444")
-        self.lbl_info.grid(row=6, column=0, sticky="w", pady=(4,0))
+        self.lbl_info.grid(row=6, column=0, sticky="w", pady=(4, 0))
 
-        # bindings
         self.ent_search.bind("<Return>", lambda e: self._apply_search())
 
-        # make grid stretch
         self.rowconfigure(4, weight=1)
         self.columnconfigure(0, weight=1)
 
@@ -551,7 +683,6 @@ class InventoryScreen(ttk.Frame):
     def _on_filters_applied(self):
         self.app.state.page_index = 0
         self.refresh_table()
-        # Build message
         s = []
         if self.app.state.filter_categories:
             s.append(f"Category={','.join(sorted(self.app.state.filter_categories))}")
@@ -583,20 +714,12 @@ class InventoryScreen(ttk.Frame):
             self.refresh_table()
 
     def refresh_table(self):
-        # build data
         rows, total = self.app.state.query_supplies()
-
-        # clear
         for iid in self.tree.get_children():
             self.tree.delete(iid)
-
-        # add rows
-
         for s in rows:
             vals = s.to_row() + [s.id]
             self.tree.insert("", "end", values=vals)
-
-        # info & pagination buttons
         shown = len(rows)
         self.lbl_info.config(text=f"{shown} results (of {total})")
         self._rebuild_page_buttons(total)
@@ -607,7 +730,6 @@ class InventoryScreen(ttk.Frame):
         page_count = max(1, math.ceil(total / self.app.state.page_size))
         cur = self.app.state.page_index
 
-        # Show up to 7 page buttons centered around current
         start = max(0, cur - 3)
         end = min(page_count, start + 7)
         start = max(0, end - 7)
@@ -622,7 +744,6 @@ class InventoryScreen(ttk.Frame):
                 btn.state(["disabled"])
             btn.grid(row=0, column=i - start, padx=2)
 
-        # enable/disable prev/next
         self.btn_prev.state(["!disabled"] if cur > 0 else ["disabled"])
         self.btn_next.state(["!disabled"] if cur < page_count - 1 else ["disabled"])
 
@@ -631,8 +752,49 @@ class InventoryScreen(ttk.Frame):
             self.app.state.page_index = i
             self.refresh_table()
 
+
+def _add_convert_button(
+    parent_frame: ttk.Frame,
+    app: "App",
+    get_qty: Callable[[], str],
+    get_unit: Callable[[], str],
+    set_qty: Callable[[str], None],
+    set_unit: Callable[[str], None],
+    grid_row: int,
+    grid_col: int,
+) -> ttk.Button:
+    """
+    Helper that inserts a small 'Convert…' button into a form grid.
+    Clicking it opens ConvertDialog pre-filled with the current qty/unit values.
+    On accept, writes the result back via set_qty / set_unit.
+    """
+    def _open():
+        def _on_accept(new_val: float, new_unit: str):
+            set_qty(f"{new_val:g}")
+            # Only update the unit combobox if the returned unit is in the
+            # inventory UNITS list; otherwise leave it as-is so the user can
+            # decide manually.
+            if new_unit in UNITS:
+                set_unit(new_unit)
+            else:
+                app.show_banner(
+                    "info",
+                    f"Converted to {new_unit} — unit not in inventory list, "
+                    "quantity updated but unit unchanged.",
+                )
+
+        ConvertDialog(parent_frame, app,
+                      initial_value=get_qty(),
+                      initial_unit=get_unit(),
+                      on_accept=_on_accept)
+
+    btn = ttk.Button(parent_frame, text="Convert…", command=_open)
+    btn.grid(row=grid_row, column=grid_col, padx=(4, 0), pady=4, sticky="w")
+    return btn
+
+
 class DetailScreen(ttk.Frame):
-    """S2: Supply Detail/Edit"""
+    """S2: Supply Detail/Edit — with inline unit conversion."""
     def __init__(self, master, app: "App"):
         super().__init__(master, padding=12)
         self.app = app
@@ -644,38 +806,51 @@ class DetailScreen(ttk.Frame):
         ttk.Label(top, text="Edit Supply", font=("Segoe UI", 12, "bold")).grid(row=0, column=1, sticky="w", padx=8)
 
         form = ttk.Frame(self)
-        form.grid(row=1, column=0, sticky="nsew", pady=(10,0))
-        # Name
+        form.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+
         ttk.Label(form, text="Name").grid(row=0, column=0, sticky="w")
         self.ent_name = ttk.Entry(form, width=40)
         self.ent_name.grid(row=0, column=1, sticky="w", padx=8, pady=4)
-        # Category
+
         ttk.Label(form, text="Category").grid(row=1, column=0, sticky="w")
         self.cmb_cat = ttk.Combobox(form, values=CATEGORIES, state="readonly", width=20)
         self.cmb_cat.grid(row=1, column=1, sticky="w", padx=8, pady=4)
-        # Quantity & Unit
+
+        # ── Quantity + Unit + Convert button ──────────────
         ttk.Label(form, text="Quantity").grid(row=2, column=0, sticky="w")
         self.ent_qty = ttk.Entry(form, width=10)
         self.ent_qty.grid(row=2, column=1, sticky="w", padx=8, pady=4)
+
         ttk.Label(form, text="Unit").grid(row=2, column=2, sticky="w")
         self.cmb_unit = ttk.Combobox(form, values=UNITS, state="readonly", width=12)
         self.cmb_unit.grid(row=2, column=3, sticky="w", padx=8, pady=4)
-        # Color / Brand / Tags
+
+        # Convert button wired to the qty/unit fields above
+        _add_convert_button(
+            form, app,
+            get_qty=lambda: self.ent_qty.get(),
+            get_unit=lambda: self.cmb_unit.get(),
+            set_qty=lambda v: (self.ent_qty.delete(0, tk.END), self.ent_qty.insert(0, v)),
+            set_unit=lambda u: self.cmb_unit.set(u),
+            grid_row=2, grid_col=4,
+        )
+
         ttk.Label(form, text="Color").grid(row=3, column=0, sticky="w")
         self.ent_color = ttk.Entry(form, width=20)
         self.ent_color.grid(row=3, column=1, sticky="w", padx=8, pady=4)
+
         ttk.Label(form, text="Brand").grid(row=3, column=2, sticky="w")
         self.ent_brand = ttk.Entry(form, width=20)
         self.ent_brand.grid(row=3, column=3, sticky="w", padx=8, pady=4)
+
         ttk.Label(form, text="Tags (comma-separated)").grid(row=4, column=0, sticky="w")
         self.ent_tags = ttk.Entry(form, width=40)
         self.ent_tags.grid(row=4, column=1, columnspan=3, sticky="ew", padx=8, pady=4)
-        # Notes
+
         ttk.Label(form, text="Notes").grid(row=5, column=0, sticky="nw")
         self.txt_notes = tk.Text(form, width=60, height=6, wrap="word")
         self.txt_notes.grid(row=5, column=1, columnspan=3, sticky="ew", padx=8, pady=4)
 
-        # Buttons
         btns = ttk.Frame(self)
         btns.grid(row=2, column=0, sticky="w", pady=8)
         ttk.Button(btns, text="Save changes", command=self._save).grid(row=0, column=0, padx=(0, 6))
@@ -710,7 +885,6 @@ class DetailScreen(ttk.Frame):
         if not s:
             self.app.show_banner("error", "Item not found.")
             return
-        # apply
         s.name = self.ent_name.get().strip()
         s.category = self.cmb_cat.get().strip()
         s.quantity = float(self.ent_qty.get().strip())
@@ -750,8 +924,9 @@ class DetailScreen(ttk.Frame):
             return False, "Quantity must be a number ≥ 0."
         return True, ""
 
+
 class AddManualScreen(ttk.Frame):
-    """S3a: Add Supply (Manual)"""
+    """S3a: Add Supply (Manual) — with inline unit conversion."""
     def __init__(self, master, app: "App"):
         super().__init__(master, padding=12)
         self.app = app
@@ -762,7 +937,7 @@ class AddManualScreen(ttk.Frame):
         ttk.Label(top, text="Add Supply", font=("Segoe UI", 12, "bold")).grid(row=0, column=1, sticky="w", padx=8)
 
         form = ttk.Frame(self)
-        form.grid(row=1, column=0, sticky="nsew", pady=(10,0))
+        form.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
 
         ttk.Label(form, text="Name*").grid(row=0, column=0, sticky="w")
         self.ent_name = ttk.Entry(form, width=40)
@@ -776,9 +951,19 @@ class AddManualScreen(ttk.Frame):
         self.cmb_unit = ttk.Combobox(form, values=UNITS, state="readonly", width=12)
         self.cmb_unit.grid(row=1, column=3, sticky="w", padx=8, pady=4)
 
+        # ── Quantity + Convert button ──────────────────────
         ttk.Label(form, text="Quantity*").grid(row=2, column=0, sticky="w")
         self.ent_qty = ttk.Entry(form, width=10)
         self.ent_qty.grid(row=2, column=1, sticky="w", padx=8, pady=4)
+
+        _add_convert_button(
+            form, app,
+            get_qty=lambda: self.ent_qty.get(),
+            get_unit=lambda: self.cmb_unit.get(),
+            set_qty=lambda v: (self.ent_qty.delete(0, tk.END), self.ent_qty.insert(0, v)),
+            set_unit=lambda u: self.cmb_unit.set(u),
+            grid_row=2, grid_col=2,
+        )
 
         ttk.Label(form, text="Color").grid(row=3, column=0, sticky="w")
         self.ent_color = ttk.Entry(form, width=20)
@@ -798,7 +983,7 @@ class AddManualScreen(ttk.Frame):
 
         btns = ttk.Frame(self)
         btns.grid(row=2, column=0, sticky="w", pady=8)
-        ttk.Button(btns, text="Save item", command=self._save).grid(row=0, column=0, padx=(0,6))
+        ttk.Button(btns, text="Save item", command=self._save).grid(row=0, column=0, padx=(0, 6))
         ttk.Button(btns, text="Cancel", command=self.app.show_inventory).grid(row=0, column=1)
 
         ttk.Label(self, text="Fields marked * are required.").grid(row=3, column=0, sticky="w", padx=2)
@@ -842,8 +1027,14 @@ class AddManualScreen(ttk.Frame):
         self.app.show_banner("success", "Item created.")
         self.app.show_inventory()
 
+
 class AddLookupScreen(ttk.Frame):
-    """S3b: Add Supply via Lookup (optional)"""
+    """
+    S3b: Add Supply via Barcode Lookup.
+    Makes a real HTTP GET to the Barcode Lookup microservice (port 8020).
+    On success the returned fields are pre-filled and remain editable.
+    On service errors an error banner with a Retry button is shown.
+    """
     def __init__(self, master, app: "App"):
         super().__init__(master, padding=12)
         self.app = app
@@ -851,65 +1042,124 @@ class AddLookupScreen(ttk.Frame):
         top = ttk.Frame(self)
         top.grid(row=0, column=0, sticky="ew")
         ttk.Button(top, text="← Back", command=self.app.show_inventory).grid(row=0, column=0, sticky="w")
-        ttk.Label(top, text="Add Supply via Lookup", font=("Segoe UI", 12, "bold")).grid(row=0, column=1, sticky="w", padx=8)
+        ttk.Label(top, text="Add Supply via Barcode Lookup", font=("Segoe UI", 12, "bold")).grid(row=0, column=1, sticky="w", padx=8)
 
         frm = ttk.Frame(self)
-        frm.grid(row=1, column=0, sticky="nsew", pady=(10,0))
+        frm.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+
+        # ── Barcode entry row ──────────────────────────────
         ttk.Label(frm, text="Barcode/SKU").grid(row=0, column=0, sticky="w")
         self.ent_code = ttk.Entry(frm, width=30)
         self.ent_code.grid(row=0, column=1, sticky="w", padx=8)
+        self.ent_code.bind("<Return>", lambda e: self._lookup())
         ttk.Button(frm, text="Lookup", command=self._lookup).grid(row=0, column=2, padx=4)
 
-        # result fields
+        # ── Result fields (pre-filled, editable) ──────────
         self._fields: Dict[str, ttk.Entry | ttk.Combobox] = {}
-        row = 1
-        for label, wid, typ in [
-            ("Name", 40, "entry"),
-            ("Brand", 20, "entry"),
-            ("Category", 20, "combo"),
-            ("Unit", 12, "combo"),
+        field_defs = [
+            ("Name",        40, "entry"),
+            ("Brand",       20, "entry"),
+            ("Category",    20, "combo"),
+            ("Unit",        12, "combo"),
             ("Default Qty", 10, "entry"),
-            ("Color", 20, "entry"),
-        ]:
-            ttk.Label(frm, text=label).grid(row=row, column=0, sticky="w", pady=(6,2))
+            ("Color",       20, "entry"),
+        ]
+        for row_i, (label, wid, typ) in enumerate(field_defs, start=1):
+            ttk.Label(frm, text=label).grid(row=row_i, column=0, sticky="w", pady=(6, 2))
             if typ == "entry":
-                e = ttk.Entry(frm, width=wid)
+                w: ttk.Entry | ttk.Combobox = ttk.Entry(frm, width=wid)
             else:
-                e = ttk.Combobox(frm, values=(CATEGORIES if label=="Category" else UNITS), state="readonly", width=wid)
-            e.grid(row=row, column=1, sticky="w", padx=8)
-            self._fields[label] = e
-            row += 1
+                vals = CATEGORIES if label == "Category" else UNITS
+                w = ttk.Combobox(frm, values=vals, state="readonly", width=wid)
+            w.grid(row=row_i, column=1, sticky="w", padx=8)
+            self._fields[label] = w
+
+        # ── Inline banner for lookup errors ───────────────
+        self.banner = Banner(self)
+        self.banner.grid_forget()  # hidden until needed; placed in row 2
 
         btns = ttk.Frame(self)
-        btns.grid(row=2, column=0, sticky="w", pady=8)
-        ttk.Button(btns, text="Save item", command=self._save).grid(row=0, column=0, padx=(0,6))
+        btns.grid(row=3, column=0, sticky="w", pady=8)
+        ttk.Button(btns, text="Save item", command=self._save).grid(row=0, column=0, padx=(0, 6))
         ttk.Button(btns, text="Cancel", command=self.app.show_inventory).grid(row=0, column=1)
 
-        self._demo_catalog = {
-            "0123456789": dict(Name="DK Yarn Blue", Brand="Cascade", Category="Yarn", Unit="skein", **{"Default Qty":"1", "Color":"Blue"}),
-        }
+    # ── Helpers ───────────────────────────────────────────
 
-    def _lookup(self):
-        code = self.ent_code.get().strip()
-        rec = self._demo_catalog.get(code)
-        if not rec:
-            self.app.show_banner("error", "Not found—switch to Manual Add?")
-            return
-        # fill results (editable)
-        for k, v in rec.items():
-            w = self._fields[k]
+    def _clear_fields(self):
+        for label, w in self._fields.items():
             if isinstance(w, ttk.Combobox):
-                w.set(v)
+                w.set("")
             else:
                 w.delete(0, tk.END)
-                w.insert(0, v)
+
+    def _fill_fields(self, data: dict):
+        """Map service response keys → form fields."""
+        mapping = {
+            "name":     "Name",
+            "brand":    "Brand",
+            "category": "Category",
+            "unit":     "Unit",
+            "size":     "Default Qty",   # use 'size' as a hint; user edits qty manually
+            "color":    "Color",
+        }
+        # Service doesn't have a 'color' field, but we leave Color blank if absent.
+        for svc_key, form_key in mapping.items():
+            val = data.get(svc_key) or ""
+            w = self._fields[form_key]
+            if isinstance(w, ttk.Combobox):
+                w.set(str(val))
+            else:
+                w.delete(0, tk.END)
+                w.insert(0, str(val))
+        # Default Qty to 1 if the service returned no useful size info
+        qty_w = self._fields["Default Qty"]
+        if not qty_w.get().strip():
+            qty_w.insert(0, "1")
+
+    # ── Lookup: calls barcode microservice ────────────────
+
+    def _lookup(self):
+        self.banner.hide()
+        self._clear_fields()
+        code = self.ent_code.get().strip()
+        if not code:
+            self.banner.show("warn", "Enter a barcode before looking up.")
+            self.banner.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+            return
+
+        def attempt():
+            try:
+                data = barcode_lookup(code)
+                self._fill_fields(data)
+                self.app.show_banner("success", f"Barcode {code} found — review and save.")
+                self.banner.hide()
+            except LookupError:
+                self.banner.show(
+                    "warn",
+                    f"Barcode '{code}' not found in catalog. "
+                    "Fill in the fields manually or use Add Supply instead.",
+                )
+                self.banner.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+            except ValueError as e:
+                self.banner.show("error", f"Invalid barcode: {e}")
+                self.banner.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+            except RuntimeError as e:
+                msg = f"Barcode service unavailable: {e}"
+                self.banner.show("error", msg, retry=attempt)
+                self.banner.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+                # Also surface in app-level banner
+                self.app.show_banner("error", msg, retry=attempt)
+
+        attempt()
+
+    # ── Save ──────────────────────────────────────────────
 
     def _save(self):
-        # Minimal validation; push user to manual on gaps
-        name = self._fields["Name"].get().strip()
-        cat = self._fields["Category"].get().strip()
-        unit = self._fields["Unit"].get().strip()
-        qty = self._fields["Default Qty"].get().strip() or "1"
+        name  = self._fields["Name"].get().strip()
+        cat   = self._fields["Category"].get().strip()
+        unit  = self._fields["Unit"].get().strip()
+        qty   = self._fields["Default Qty"].get().strip() or "1"
+
         if not name or not cat or not unit:
             self.app.show_banner("warn", "Please complete Name, Category, and Unit (or switch to Manual Add).")
             return
@@ -920,6 +1170,7 @@ class AddLookupScreen(ttk.Frame):
         except ValueError:
             self.app.show_banner("warn", "Default Qty must be a number ≥ 0.")
             return
+
         s = Supply(
             id=0,
             name=name,
@@ -933,10 +1184,10 @@ class AddLookupScreen(ttk.Frame):
         self.app.show_banner("success", "Item created.")
         self.app.show_inventory()
 
-# ---------------------------
-# App Shell (navigation, banner, logout)
-# ---------------------------
 
+# ---------------------------
+# App Shell
+# ---------------------------
 
 class App(tk.Tk):
     def __init__(self):
@@ -947,42 +1198,33 @@ class App(tk.Tk):
 
         self.state = AppState()
 
-        # Root layout: Topbar (title row), Banner (S5), Content frame
         self.topbar = ttk.Frame(self, padding=(10, 10, 10, 0))
         self.topbar.grid(row=0, column=0, sticky="ew")
         self.topbar.columnconfigure(0, weight=1)
-        ttk.Label(self.topbar, text="Crafting Inventory", font=("Segoe UI", 14, "bold")).grid(
-            row=0, column=0, sticky="w"
-        )
-        # NEW: persistent Home button (available on all screens)
+        ttk.Label(self.topbar, text="Crafting Inventory", font=("Segoe UI", 14, "bold")).grid(row=0, column=0, sticky="w")
         ttk.Button(self.topbar, text="Home", command=self.show_home).grid(row=0, column=1, sticky="e")
 
         self.banner = Banner(self)
-        # placeholder grid row for banner is row=1 (Banner handles its own show/hide)
 
         self.content = ttk.Frame(self, padding=(10, 0, 10, 10))
         self.content.grid(row=2, column=0, sticky="nsew")
         self.rowconfigure(2, weight=1)
         self.columnconfigure(0, weight=1)
 
-        # Screens (swap LoginScreen -> HomeScreen)
         self.screens: Dict[str, ttk.Frame] = {
-            "home": HomeScreen(self.content, self),
-            "inventory": InventoryScreen(self.content, self),
-            "detail": DetailScreen(self.content, self),
+            "home":       HomeScreen(self.content, self),
+            "inventory":  InventoryScreen(self.content, self),
+            "detail":     DetailScreen(self.content, self),
             "add_manual": AddManualScreen(self.content, self),
             "add_lookup": AddLookupScreen(self.content, self),
         }
         for s in self.screens.values():
             s.grid(row=0, column=0, sticky="nsew")
 
-        # Start at Home
         self.show_home()
 
-    # --- Navigation ---
     def _raise(self, key: str):
         self.screens[key].tkraise()
-        # call screen-specific hooks
         if key == "home":
             self.screens["home"].focus_first()
         if key == "inventory":
@@ -1008,10 +1250,16 @@ class App(tk.Tk):
     def show_banner(self, kind: str, message: str, retry: Optional[Callable[[], None]] = None):
         self.banner.show(kind, message, retry)
 
+    def confirm_logout(self):
+        if messagebox.askyesno("Logout", "Log out and return to home?"):
+            self.state.current_user = None
+            self.show_home()
+
 
 def main():
     app = App()
     app.mainloop()
+
 
 if __name__ == "__main__":
     main()
