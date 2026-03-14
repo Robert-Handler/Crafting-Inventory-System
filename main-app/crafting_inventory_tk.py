@@ -60,7 +60,9 @@ def _http_post(url: str, payload: dict) -> dict:
         raise RuntimeError(str(e))
     if r.status_code == 400:
         detail = r.json().get("detail", {})
-        raise ValueError(detail.get("details", "Bad request."))
+        if isinstance(detail, dict):
+            raise ValueError(detail.get("details", "Bad request."))
+        raise ValueError(str(detail))
     if not r.ok:
         raise RuntimeError(f"Service error {r.status_code}: {r.text[:200]}")
     return r.json()
@@ -101,7 +103,9 @@ def _http_put(url: str, payload: dict) -> dict:
         raise RuntimeError(str(e))
     if r.status_code == 400:
         detail = r.json().get("detail", {})
-        raise ValueError(detail.get("details", "Bad request."))
+        if isinstance(detail, dict):
+            raise ValueError(detail.get("details", "Bad request."))
+        raise ValueError(str(detail))
     if not r.ok:
         raise RuntimeError(f"Service error {r.status_code}: {r.text[:200]}")
     return r.json()
@@ -171,7 +175,7 @@ def email_validate(email: str) -> str:
 # ---------------------------
 
 CATEGORIES = ["Yarn", "Fabric", "Tool", "Notion", "Other"]
-UNITS = ["skein", "g", "m", "yd", "pair", "pcs"]
+UNITS = ["skein", "g", "m", "yd", "pair", "pcs", "mm", "cm", "m", "km", "in", "ft", "mi", "mg", "kg", "lb", "oz"]
 
 @dataclass
 class Supply:
@@ -1053,90 +1057,6 @@ class DetailScreen(ttk.Frame):
                 self.app.show_banner(
                     "error",
                     f"Tagging service unavailable: {e}",
-                    retry=attempt,
-                )
-
-        attempt()
-
-    # ── Notes service helpers ──────────────────────────────────────────────────
-
-    def _load_notes(self):
-        """Fetch notes for the current supply from the Notes service."""
-        self.notes_listbox.delete(0, tk.END)
-        self._notes_cache = []
-        if self._current_id is None:
-            return
-
-        def attempt():
-            try:
-                notes = notes_for_supply(self._current_id)
-                self._notes_cache = notes
-                self.notes_listbox.delete(0, tk.END)
-                for n in notes:
-                    display = f"{n.get('title', '(no title)')}  —  {n.get('content', '')[:60]}"
-                    self.notes_listbox.insert(tk.END, display)
-            except RuntimeError as e:
-                self.app.show_banner(
-                    "error",
-                    f"Notes service unavailable: {e}",
-                    retry=attempt,
-                )
-
-        attempt()
-
-    def _add_note(self):
-        """Create a new note via the Notes service and refresh the list."""
-        if self._current_id is None:
-            return
-        title   = self.ent_note_title.get().strip()
-        content = self.ent_note_content.get().strip()
-        if not title:
-            self.app.show_banner("warn", "Note title is required.")
-            return
-
-        def attempt():
-            try:
-                note_create(self._current_id, title, content)
-                self.ent_note_title.delete(0, tk.END)
-                self.ent_note_content.delete(0, tk.END)
-                self._load_notes()
-                self.app.show_banner("success", "Note added.")
-            except RuntimeError as e:
-                self.app.show_banner(
-                    "error",
-                    f"Notes service unavailable: {e}",
-                    retry=attempt,
-                )
-
-        attempt()
-
-    def _delete_note(self):
-        """Delete the selected note via the Notes service."""
-        sel = self.notes_listbox.curselection()
-        if not sel:
-            self.app.show_banner("warn", "Select a note to delete.")
-            return
-        idx = sel[0]
-        if idx >= len(self._notes_cache):
-            return
-        note = self._notes_cache[idx]
-        note_id = note.get("id", "")
-
-        if not messagebox.askyesno("Delete note", f"Delete note '{note.get('title', '')}'?"):
-            return
-
-        def attempt():
-            try:
-                note_delete(note_id)
-                self._load_notes()
-                self.app.show_banner("info", "Note deleted.")
-            except LookupError:
-                self.app.show_banner("warn", "Note not found on service (may already be deleted).")
-                self._load_notes()
-            except RuntimeError as e:
-                self.app.show_banner(
-                    "error",
-                    f"Notes service unavailable: {e}",
                     retry=attempt,
                 )
 
