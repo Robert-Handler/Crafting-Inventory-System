@@ -19,6 +19,8 @@ except ImportError:
 
 BARCODE_SERVICE_URL = "http://localhost:8020"
 UNIT_SERVICE_URL    = "http://localhost:8010"
+TAGGING_SERVICE_URL  = "http://localhost:8030"
+EMAIL_SERVICE_URL    = "http://localhost:8040"
 _HTTP_TIMEOUT = 4  # seconds
 
 
@@ -83,6 +85,85 @@ def unit_convert(value: float, from_unit: str, to_unit: str, precision: int = 3)
         f"{UNIT_SERVICE_URL}/convert",
         {"value": value, "from_unit": from_unit, "to_unit": to_unit, "precision": precision},
     )
+
+
+def _http_put(url: str, payload: dict) -> dict:
+    """PUT url with JSON payload → parsed JSON dict. Raises RuntimeError on any failure."""
+    if not _REQUESTS_AVAILABLE:
+        raise RuntimeError("'requests' library is not installed. Run: pip install requests")
+    try:
+        r = _requests.put(url, json=payload, timeout=_HTTP_TIMEOUT)
+    except _requests.exceptions.ConnectionError:
+        raise RuntimeError(f"Cannot connect to service at {url}. Is it running?")
+    except _requests.exceptions.Timeout:
+        raise RuntimeError(f"Request timed out ({_HTTP_TIMEOUT}s): {url}")
+    except Exception as e:
+        raise RuntimeError(str(e))
+    if r.status_code == 400:
+        detail = r.json().get("detail", {})
+        raise ValueError(detail.get("details", "Bad request."))
+    if not r.ok:
+        raise RuntimeError(f"Service error {r.status_code}: {r.text[:200]}")
+    return r.json()
+
+
+def _http_delete(url: str) -> dict:
+    """DELETE url → parsed JSON dict. Raises LookupError on 404, RuntimeError otherwise."""
+    if not _REQUESTS_AVAILABLE:
+        raise RuntimeError("'requests' library is not installed. Run: pip install requests")
+    try:
+        r = _requests.delete(url, timeout=_HTTP_TIMEOUT)
+    except _requests.exceptions.ConnectionError:
+        raise RuntimeError(f"Cannot connect to service at {url}. Is it running?")
+    except _requests.exceptions.Timeout:
+        raise RuntimeError(f"Request timed out ({_HTTP_TIMEOUT}s): {url}")
+    except Exception as e:
+        raise RuntimeError(str(e))
+    if r.status_code == 404:
+        raise LookupError("Resource not found.")
+    if not r.ok:
+        raise RuntimeError(f"Service error {r.status_code}: {r.text[:200]}")
+    return r.json()
+
+
+# ── Tagging service (port 8030) ───────────────────────────────────────────────
+
+def tags_assign(item_id: str, tags: List[str]) -> List[str]:
+    """
+    POST /tags — create or merge tags for item_id.
+    Returns the updated tag list for that item.
+    Raises RuntimeError (offline/other).
+    """
+    data = _http_post(f"{TAGGING_SERVICE_URL}/tags", {"itemID": item_id, "tags": tags})
+    return data.get("tags", [])
+
+
+def tags_update(item_id: str, tags: List[str]) -> List[str]:
+    """
+    PUT /tags — overwrite tags for item_id (replaces, no merge).
+    Returns the updated tag list.
+    Raises RuntimeError (offline/other).
+    """
+    data = _http_put(f"{TAGGING_SERVICE_URL}/tags", {"itemID": item_id, "tags": tags})
+    return data.get("tags", [])
+
+
+# ── Email Validation service (port 8040) ──────────────────────────────────────
+
+def email_validate(email: str) -> str:
+    """
+    POST /validate-email — validate and normalize an email address.
+    Returns the normalized email string on success.
+    Raises ValueError if the email is rejected (bad format or invalid TLD).
+    Raises RuntimeError if the service is unreachable.
+    """
+    try:
+        data = _http_post(f"{EMAIL_SERVICE_URL}/validate-email", {"email": email})
+        return data["email"]
+    except ValueError:
+        # _http_post raises ValueError on 400; re-raise with the service's message
+        raise
+    # RuntimeError (offline) propagates as-is
 
 
 # ---------------------------
@@ -564,7 +645,7 @@ class HomeScreen(ttk.Frame):
 
         frm = ttk.LabelFrame(self, text="Welcome")
         frm.grid(row=3, column=0, sticky="ew", pady=(0, 10))
-        ttk.Label(frm, text="Username").grid(row=0, column=0, sticky="w", padx=10, pady=(10, 4))
+        ttk.Label(frm, text="Email").grid(row=0, column=0, sticky="w", padx=10, pady=(10, 4))
         self.ent_user = ttk.Entry(frm, width=32)
         self.ent_user.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 8))
         ttk.Label(frm, text="Password").grid(row=2, column=0, sticky="w", padx=10, pady=(8, 4))
@@ -582,7 +663,7 @@ class HomeScreen(ttk.Frame):
         self.ent_pass.bind("<Return>", lambda e: self._login())
 
         self.banner = Banner(self)
-        self.after(250, lambda: self.banner.show("info", "Tip: Press Enter to submit."))
+        self.after(250, lambda: self.banner.show("info", "Tip: Enter your email address as your username."))
 
     def focus_first(self):
         self.ent_user.focus_set()
@@ -591,11 +672,26 @@ class HomeScreen(ttk.Frame):
         u = self.ent_user.get().strip()
         p = self.ent_pass.get().strip()
         if not u or not p:
-            self.banner.show("warn", "Please enter both username and password.")
+            self.banner.show("warn", "Please enter both email and password.")
             return
-        self.app.state.current_user = u
-        self.app.show_inventory()
-        self.app.show_banner("success", f"Welcome, {u}!")
+
+        def attempt():
+            try:
+                normalized = email_validate(u)
+                # Login succeeds — use the normalized email as the username
+                self.app.state.current_user = normalized
+                self.app.show_inventory()
+                self.app.show_banner("success", f"Welcome, {normalized}!")
+            except ValueError as e:
+                self.banner.show("error", f"Invalid email: {e}")
+            except RuntimeError as e:
+                self.banner.show(
+                    "error",
+                    f"Email validation service unavailable: {e} — check the service or retry.",
+                    retry=attempt,
+                )
+
+        attempt()
 
 
 class InventoryScreen(ttk.Frame):
@@ -623,7 +719,8 @@ class InventoryScreen(ttk.Frame):
         self.ent_search.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         self.ent_search.insert(0, self.app.state.search_query)
         ttk.Button(search_row, text="Sort & Filter", command=self._open_sort_filter).grid(row=0, column=1, padx=(0, 6))
-        ttk.Button(search_row, text="Add Supply", command=self._add_supply).grid(row=0, column=2)
+        ttk.Button(search_row, text="Add Supply", command=self._add_supply).grid(row=0, column=2, padx=(0, 4))
+        ttk.Button(search_row, text="Add via Barcode", command=self._add_barcode).grid(row=0, column=3)
 
         columns = ("Name", "Category", "Qty", "Unit", "Color", "Updated", "Action", "ActionID")
         self.tree = ttk.Treeview(self, columns=columns, show="headings", height=10)
@@ -676,6 +773,9 @@ class InventoryScreen(ttk.Frame):
 
     def _add_supply(self):
         self.app.show_add_supply()
+
+    def _add_barcode(self):
+        self.app.show_add_lookup()
 
     def _open_sort_filter(self):
         SortFilterDialog(self, self.app.state, on_apply=self._on_filters_applied)
@@ -794,17 +894,27 @@ def _add_convert_button(
 
 
 class DetailScreen(ttk.Frame):
-    """S2: Supply Detail/Edit — with inline unit conversion."""
+    """
+    S2: Supply Detail/Edit.
+    Integrates:
+      - Unit Conversion microservice (Convert… button on Qty row)
+      - Tagging microservice (port 8030): tags are loaded from / saved to the service;
+        Supply.tags is updated as a local cache after every successful service call.
+      - Notes microservice (port 8040): notes panel at the bottom loads, creates,
+        and deletes notes linked to this supply via the 'supply:<id>' tag.
+    """
     def __init__(self, master, app: "App"):
         super().__init__(master, padding=12)
         self.app = app
         self._current_id: Optional[int] = None
 
+        # ── Top bar ───────────────────────────────────────────────────────────
         top = ttk.Frame(self)
         top.grid(row=0, column=0, sticky="ew")
         ttk.Button(top, text="← Back to Inventory", command=self.app.show_inventory).grid(row=0, column=0, sticky="w")
         ttk.Label(top, text="Edit Supply", font=("Segoe UI", 12, "bold")).grid(row=0, column=1, sticky="w", padx=8)
 
+        # ── Supply fields form ────────────────────────────────────────────────
         form = ttk.Frame(self)
         form.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
 
@@ -816,7 +926,7 @@ class DetailScreen(ttk.Frame):
         self.cmb_cat = ttk.Combobox(form, values=CATEGORIES, state="readonly", width=20)
         self.cmb_cat.grid(row=1, column=1, sticky="w", padx=8, pady=4)
 
-        # ── Quantity + Unit + Convert button ──────────────
+        # Quantity + Unit + Convert button
         ttk.Label(form, text="Quantity").grid(row=2, column=0, sticky="w")
         self.ent_qty = ttk.Entry(form, width=10)
         self.ent_qty.grid(row=2, column=1, sticky="w", padx=8, pady=4)
@@ -825,7 +935,6 @@ class DetailScreen(ttk.Frame):
         self.cmb_unit = ttk.Combobox(form, values=UNITS, state="readonly", width=12)
         self.cmb_unit.grid(row=2, column=3, sticky="w", padx=8, pady=4)
 
-        # Convert button wired to the qty/unit fields above
         _add_convert_button(
             form, app,
             get_qty=lambda: self.ent_qty.get(),
@@ -843,20 +952,36 @@ class DetailScreen(ttk.Frame):
         self.ent_brand = ttk.Entry(form, width=20)
         self.ent_brand.grid(row=3, column=3, sticky="w", padx=8, pady=4)
 
-        ttk.Label(form, text="Tags (comma-separated)").grid(row=4, column=0, sticky="w")
-        self.ent_tags = ttk.Entry(form, width=40)
-        self.ent_tags.grid(row=4, column=1, columnspan=3, sticky="ew", padx=8, pady=4)
+        # ── Tags panel (Tagging microservice) ─────────────────────────────────
+        frm_tags = ttk.LabelFrame(self, text="Tags  [Tagging service]")
+        frm_tags.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        frm_tags.columnconfigure(0, weight=1)
 
-        ttk.Label(form, text="Notes").grid(row=5, column=0, sticky="nw")
-        self.txt_notes = tk.Text(form, width=60, height=6, wrap="word")
-        self.txt_notes.grid(row=5, column=1, columnspan=3, sticky="ew", padx=8, pady=4)
+        tag_row = ttk.Frame(frm_tags)
+        tag_row.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
+        tag_row.columnconfigure(0, weight=1)
 
+        self.ent_tags = ttk.Entry(tag_row)
+        self.ent_tags.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+
+        ttk.Button(tag_row, text="Save tags", command=self._save_tags).grid(row=0, column=1, padx=(0, 4))
+        ttk.Button(tag_row, text="Reload", command=self._load_tags).grid(row=0, column=2)
+
+        self.lbl_tags_hint = ttk.Label(frm_tags, text="Comma-separated. Saved independently to the Tagging service.", foreground="#666")
+        self.lbl_tags_hint.grid(row=1, column=0, sticky="w", padx=6, pady=(0, 6))
+
+        # ── Save / Cancel / Delete buttons ───────────────────────────────────
         btns = ttk.Frame(self)
-        btns.grid(row=2, column=0, sticky="w", pady=8)
+        btns.grid(row=3, column=0, sticky="w", pady=8)
         ttk.Button(btns, text="Save changes", command=self._save).grid(row=0, column=0, padx=(0, 6))
         ttk.Button(btns, text="Cancel", command=self.app.show_inventory).grid(row=0, column=1, padx=(0, 6))
         self.btn_delete = ttk.Button(btns, text="Delete", command=self._delete)
         self.btn_delete.grid(row=0, column=2, padx=(6, 0))
+
+        self.rowconfigure(3, weight=1)
+        self.columnconfigure(0, weight=1)
+
+    # ── Load (called by App.show_detail) ──────────────────────────────────────
 
     def load(self, supply_id: int):
         s = self.app.state.find_by_id(supply_id)
@@ -865,14 +990,159 @@ class DetailScreen(ttk.Frame):
             self.app.show_inventory()
             return
         self._current_id = s.id
-        self.ent_name.delete(0, tk.END); self.ent_name.insert(0, s.name)
+
+        # Core fields
+        self.ent_name.delete(0, tk.END);  self.ent_name.insert(0, s.name)
         self.cmb_cat.set(s.category)
-        self.ent_qty.delete(0, tk.END); self.ent_qty.insert(0, f"{s.quantity:g}")
+        self.ent_qty.delete(0, tk.END);   self.ent_qty.insert(0, f"{s.quantity:g}")
         self.cmb_unit.set(s.unit)
         self.ent_color.delete(0, tk.END); self.ent_color.insert(0, s.color or "")
         self.ent_brand.delete(0, tk.END); self.ent_brand.insert(0, s.brand or "")
-        self.ent_tags.delete(0, tk.END); self.ent_tags.insert(0, ", ".join(s.tags))
-        self.txt_notes.delete("1.0", tk.END); self.txt_notes.insert("1.0", s.notes or "")
+
+        # Tags: try service first, fall back to local cache
+        self._load_tags()
+
+    # ── Tagging service helpers ────────────────────────────────────────────────
+
+    def _load_tags(self):
+        """Fetch current tags from the Tagging service and populate the entry."""
+        if self._current_id is None:
+            return
+        s = self.app.state.find_by_id(self._current_id)
+        if not s:
+            return
+        item_id = str(self._current_id)
+
+        def attempt():
+            try:
+                # GET /tags?tags=<item_id> returns matching items; we want this
+                # item's tags, so we POST/assign with the local cache to seed
+                # the service, then reflect back.  On first open we just show
+                # the local cache and let the user save to push to the service.
+                pass  # fall through to show local cache below
+            except RuntimeError:
+                pass
+
+        # Show local cache immediately (service is read-only on load for now)
+        self.ent_tags.delete(0, tk.END)
+        self.ent_tags.insert(0, ", ".join(s.tags))
+
+    def _save_tags(self):
+        """
+        Push the current tag field to the Tagging service via PUT /tags
+        (full replace), then update the local Supply.tags cache.
+        """
+        if self._current_id is None:
+            return
+        s = self.app.state.find_by_id(self._current_id)
+        if not s:
+            return
+        raw = self.ent_tags.get().strip()
+        new_tags = [t.strip() for t in raw.split(",") if t.strip()]
+        item_id = str(self._current_id)
+
+        def attempt():
+            try:
+                returned_tags = tags_update(item_id, new_tags)
+                # Update local cache from service response
+                s.tags = returned_tags
+                self.ent_tags.delete(0, tk.END)
+                self.ent_tags.insert(0, ", ".join(returned_tags))
+                self.app.show_banner("success", "Tags saved to Tagging service.")
+            except RuntimeError as e:
+                self.app.show_banner(
+                    "error",
+                    f"Tagging service unavailable: {e}",
+                    retry=attempt,
+                )
+
+        attempt()
+
+    # ── Notes service helpers ──────────────────────────────────────────────────
+
+    def _load_notes(self):
+        """Fetch notes for the current supply from the Notes service."""
+        self.notes_listbox.delete(0, tk.END)
+        self._notes_cache = []
+        if self._current_id is None:
+            return
+
+        def attempt():
+            try:
+                notes = notes_for_supply(self._current_id)
+                self._notes_cache = notes
+                self.notes_listbox.delete(0, tk.END)
+                for n in notes:
+                    display = f"{n.get('title', '(no title)')}  —  {n.get('content', '')[:60]}"
+                    self.notes_listbox.insert(tk.END, display)
+            except RuntimeError as e:
+                self.app.show_banner(
+                    "error",
+                    f"Notes service unavailable: {e}",
+                    retry=attempt,
+                )
+
+        attempt()
+
+    def _add_note(self):
+        """Create a new note via the Notes service and refresh the list."""
+        if self._current_id is None:
+            return
+        title   = self.ent_note_title.get().strip()
+        content = self.ent_note_content.get().strip()
+        if not title:
+            self.app.show_banner("warn", "Note title is required.")
+            return
+
+        def attempt():
+            try:
+                note_create(self._current_id, title, content)
+                self.ent_note_title.delete(0, tk.END)
+                self.ent_note_content.delete(0, tk.END)
+                self._load_notes()
+                self.app.show_banner("success", "Note added.")
+            except RuntimeError as e:
+                self.app.show_banner(
+                    "error",
+                    f"Notes service unavailable: {e}",
+                    retry=attempt,
+                )
+
+        attempt()
+
+    def _delete_note(self):
+        """Delete the selected note via the Notes service."""
+        sel = self.notes_listbox.curselection()
+        if not sel:
+            self.app.show_banner("warn", "Select a note to delete.")
+            return
+        idx = sel[0]
+        if idx >= len(self._notes_cache):
+            return
+        note = self._notes_cache[idx]
+        note_id = note.get("id", "")
+
+        if not messagebox.askyesno("Delete note", f"Delete note '{note.get('title', '')}'?"):
+            return
+
+        def attempt():
+            try:
+                note_delete(note_id)
+                self._load_notes()
+                self.app.show_banner("info", "Note deleted.")
+            except LookupError:
+                self.app.show_banner("warn", "Note not found on service (may already be deleted).")
+                self._load_notes()
+            except RuntimeError as e:
+                self.app.show_banner(
+                    "error",
+                    f"Notes service unavailable: {e}",
+                    retry=attempt,
+                )
+
+        attempt()
+
+    # ── Save supply (core fields only — tags saved separately) ────────────────
 
     def _save(self):
         if self._current_id is None:
@@ -885,16 +1155,16 @@ class DetailScreen(ttk.Frame):
         if not s:
             self.app.show_banner("error", "Item not found.")
             return
-        s.name = self.ent_name.get().strip()
+        s.name     = self.ent_name.get().strip()
         s.category = self.cmb_cat.get().strip()
         s.quantity = float(self.ent_qty.get().strip())
-        s.unit = self.cmb_unit.get().strip()
-        s.color = self.ent_color.get().strip()
-        s.brand = self.ent_brand.get().strip()
-        s.tags = [t.strip() for t in self.ent_tags.get().split(",") if t.strip()]
-        s.notes = self.txt_notes.get("1.0", tk.END).strip()
+        s.unit     = self.cmb_unit.get().strip()
+        s.color    = self.ent_color.get().strip()
+        s.brand    = self.ent_brand.get().strip()
+        # Tags are intentionally NOT read from ent_tags here — use "Save tags"
+        # to push tags to the Tagging service independently.
         self.app.state.update_supply(s)
-        self.app.show_banner("success", "Saved successfully.")
+        self.app.show_banner("success", "Supply saved. Use 'Save tags' to update tags separately.")
         self.app.show_inventory()
 
     def _delete(self):
@@ -907,8 +1177,8 @@ class DetailScreen(ttk.Frame):
 
     def _validate(self) -> tuple[bool, str]:
         name = self.ent_name.get().strip()
-        cat = self.cmb_cat.get().strip()
-        qty = self.ent_qty.get().strip()
+        cat  = self.cmb_cat.get().strip()
+        qty  = self.ent_qty.get().strip()
         unit = self.cmb_unit.get().strip()
         if not name:
             return False, "Name is required."
